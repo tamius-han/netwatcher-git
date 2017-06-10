@@ -1,0 +1,462 @@
+#!/bin/bash
+
+# netwatcher 1.3
+
+# SKRIPT JE TREBA ZAGNATI KOT ROOT/S SUDO.
+# (skripta ni treba zagnati kot root/sudo, če si v sudoers datoteko
+# dodate dovoljenje za izvajanje ukaza rfkill brez gesla)
+
+#To skrbi, da se brezžična povezava prekine, če se pojavijo bullshit
+#problemi kot na primer '[gateway] Destination Host Unreachable',
+#pa čeprav je prenosnik v neposredni bližini usmerjevalnika. 
+
+#ker je prositi za delujoče wlan gonilnike preveč
+
+
+# Stvari, dodane v 0.1->0.9:
+# - reset wlan kartice v primeru izgubljenih paketov
+# - osnoven izpis z nekaj malega barvami
+# 
+# v1.0:
+# - izpis pobarvan in le v eni vrstici
+# - izpis enega znaka vsako sekundo (približno)
+# - živ izpis statistike
+# - padci povezave so zabeleženi v .netwatcher.log datoteki
+
+# v1.1: 
+# - preverjanje, če se izguba paketov dogaja zaradi tega, ker wireless kartica protestira
+#   (kar ni vredu) ali pa zato, ker je povezava zasičena (kar je sprejemljivo) — brez 
+#   preverjanja bi skript lahko usul wireless kartico tudi, če povezava deluje
+#   
+#   NOTE: Stvar predpostavlja le en vmesnik.
+
+# v1.2
+# - tfw you forget to write down the changes
+# - nekaj je moglo bit, verjetno samo popravki bugov
+
+# v1.3
+# - skript postane bolj občutljiv za visok ping v lokalnem omrežju. Kartica se sedaj resetira tudi, če
+#   ping do routerja prekorači določeno omejitev dovoljkrat
+
+test=0;
+if echo "$@" | grep -q -- "--test-mode" ; then
+  test=1
+fi
+if echo "$@" | grep -q -- "test" ; then
+  test=1
+fi
+
+local_ip=""           # ip address of your router, gets auto-set later down the line, 
+                      # used to determine if wireless went to shit
+global_ip=8.8.8.8     # ip address of somewhere on the internet, used to determine if
+                      # your internet connection went to shit
+
+shitWifiLinkTreshold=500     # if ping takes more than this ms, the script will increase the shitWifiLinkEvent count
+                             # by 1. shitWifiLinkEvent automatically decreases by 1 for every ping received under this
+                             # threshold.
+shitWifiLinkEventTreshold=10 # If this many shitWifiLinkEvents happen, the card is getting a reset
+shitWifiLinkEventIncrementWeight=2  # for every ping above shitWifiLinkTreshold, the event counter increases by this much
+shitWifiLinkEventDecrementWeight=1  # for every ping not above shitWifiLinkTreshold, the event counter decreases by this
+shortsleep=1
+lsd=1          #default long sleep
+longsleep=$lsd
+missthreshold=10 #how many lost packets before restarting
+packetloss=0
+pllimit=2
+wait=0
+waitlimit=16
+pctreshold=5
+pingcount=0
+shitWifiLinkEvents=0
+rfkillcount=0
+rfkills_per_downtime=0
+time_of_last_net=0;
+wlankilled=0
+
+downtimes=-1
+max_downtime=0
+last_downtime=0
+avg_downtime=0
+rxtxcutoff=5000           # if rx + tx is less than this number, wireless adapter will restart
+                          # when ($)packetloss hits packetloss limit ($pllimit)
+rxtxindex=0       # circular array index
+rxtx_array_size=5 # circular array size (the array is used to calculate average rx+tx for rxtxcutoff)
+
+time_of_last_downtime=0
+
+we_down=0
+
+chars=0
+
+source colors.sh
+
+
+function sigint {
+  printf "\n\n\n"
+  exit 0
+}
+
+function sigusr1 {
+  net_down=0
+}
+function sigusr2 {
+  net_down=1
+}
+
+trap 'sigint' sigint
+trap 'sigusr1' sigusr1
+trap 'sigusr2' sigusr2
+interface="non"
+for i in /sys/class/net/* ; do
+  if egrep -q ^w* <<<"$i" ; then   # Ponavadi je brezžičen vmesnik edini, ki se začne z 'w'
+    interface="$i"
+  fi
+done
+
+if [[ $interface == "non" ]] ; then
+  echo "No wireless thingies. Exiting."
+  exit 1
+fi
+
+#Dobimo naslov routerja
+
+rxtx=$(cat $interface/statistics/rx_bytes) 
+
+while [ -z $local_ip ] ; do
+  #TODO: find a proper way to get router's IP
+  local_ip=$( ifconfig ${interface##*/} | grep "broadcast" | awk '{print $6"d"}' | sed s/255d/1/ )
+done
+
+function rxtx {
+  rxtx0=$( cat $interface/statistics/rx_bytes )
+  
+  if [[ $(( $rxtx0 - $rxtx )) -ge 0 ]] ; then  # Če smo prenesli negativno število, potem je nekje prišlo
+    rxtxdiff[$rxtxindex]=$(( $rxtx0 - $rxtx )) # do preliva. Ker prelivi niso tako pogosti, ga spregledamo
+    rxtxindex=$(( $rxtxindex + 1 ))
+    if [[ $rxtxindex -ge $rxtx_array_size ]] ; then
+      rxtxindex=0;
+    fi
+  fi
+  
+  rxtx=$rxtx0
+}
+function check_rxtx {
+  i=0
+  rxtx_sum=0;
+  while [ $i -lt $rxtx_array_size ] ; do
+    rxtx_sum=$(( $rxtx_sum + ${rxtxdiff[$i]} ))
+    i=$(( $i + 1))
+  done
+  
+  rxtx_avg=$(( $rxtx_sum / $rxtx_array_size ));
+  
+  if [ $rxtx_avg -lt $rxtxcutoff ] ; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+
+function increaseChars {
+  chars=$(($chars + $1));
+  if [[ $chars -ge $(tput cols) ]] ; then
+    printf "\n\033[K"
+    chars=0;
+  fi
+}
+
+function restartwlan {
+    
+    
+    #printf "$Red\033[K"
+    #printf "$@"
+    #if [[ $test -eq 1 ]] ; then
+    #  printf "[TESTING - SIMULATION ONLY]"
+    #fi
+    #printf "\n$Color_Off\033[K"
+    if [[ $test -eq 0 ]] ; then
+      printf "${BRed}X"
+      increaseChars 1
+      sudo rfkill block wlan
+      sudo rfkill unblock wlan
+      printf "${Cyan}S${Color_Off}"
+      increaseChars 1
+    else
+      printf "${BWhite}|$Color_Off"
+      increaseChars 1
+    fi
+    wlankilled=1
+    pingcount=0
+    we_down=1
+    
+    if [[ $downtimes -lt 0 ]] ; then
+        downtimes=0
+    fi
+}
+
+function timekeeper {
+  cat /proc/uptime | cut -f1 -d"."
+}
+
+time_of_last_net=$(timekeeper)
+
+function ts_net {   #ts - time since
+  echo "$(($(timekeeper) - $time_of_last_net))"
+}
+
+function ts_down {
+  echo "$(($(timekeeper) - $time_of_last_downtime))"
+}
+
+
+function calculate_downtime {
+  last_downtime=$(( $(timekeeper) - $time_of_last_net ))
+  time_of_last_downtime=$(timekeeper);
+  if [[ $last_downtime -gt $max_downtime ]] ; then
+    max_downtime=$last_downtime
+  fi
+  if [[ $downtimes -le 1 ]] ; then
+    avg_downtime=$last_downtime;
+  else
+    avg_downtime=$(( $(( $avg_downtime * $(( $(( $(( $downtimes * 1000)) - 1000 ))  / $downtimes )) + $(( $last_downtime * $(( 1000 / $downtimes )) )) )) / 1000 ))
+  fi
+  
+  echo "$(date): This downtime lasted $last_downtime seconds" >> ~/.netwatcher.log
+}
+
+
+# base_downtime=$(( $(timekeeper) - 1 ))
+# 
+# function display_stats {
+# 
+#   while(true) ; do
+#     printf "\n\033[K"
+#     printf "Without net for: $(ts_net) | "
+#     
+#     printf "Average downtime: $avg_downtime | last downtime: $last_downtime | chars: $chars | pingcount: $pingcount"
+#     echo -en "\r\033[1A"
+#     tput cuf $chars
+#     
+#     sleep $shortsleep
+#   done;
+# }
+
+
+# display_stats &
+
+function net_daemon {
+  while(true) ; do
+    
+    
+    do_ping $global_ip &
+    while kill -0 $! >/dev/null 2>&1 ; do
+      sleep 1
+    done
+    
+    
+    wait $!
+    estatus=$?
+    
+    if [[ $estatus -ne 0 ]] ; then
+      if [[ $we_down -eq 1 ]] ; then
+        pingcount=0
+      fi
+    fi
+    
+    if [[ $estatus -eq 2 ]] ; then
+      packetloss=$(($packetloss + 1))
+      if [ $packetloss -lt $pllimit ] ; then
+        printf "${BIYellow}×$Color_Off"
+      else
+        if check_rxtx ; then
+          kill sigusr2 $PPID
+        else
+          printf "${BCyan}×$Color_Off"
+        fi
+        packetloss=0
+      fi
+    elif [[ $testing -ne 0 ]] ; then
+      kill sigusr2 $PPID
+    else              #Če je vse, kot mora biti:
+      if [[ $pingcount -eq $pctreshold ]] ; then
+        we_down=0
+        kill sigusr1 $PPID
+      fi
+      pingcount=$(( $pingcount + 1))
+      packetloss=0
+      wlankilled=0
+      wait=0
+    fi
+  done
+}
+
+function do_ping {
+  if [[ $# -eq 0 ]] ; then
+    echo "We'll need at least an IP here" >&2
+    exit 127;
+  else
+    addr=$1
+    if [[ $# -ge 1 ]] ; then
+      timeTreshold=$2
+    else
+      timeTreshold=32578
+    fi
+  fi
+  
+  response=$(ping -c 1 $addr 2>&1)
+  if echo "$response" | grep -q "Destination" ; then
+    exit 1
+  elif echo "$response" | grep -q -i "100% packet loss" ; then
+    exit 2
+  elif echo "$response" | grep -q -i "Network is unreachable" ; then
+    exit 3
+  else   # Če se je ping izvedel:
+                           # dobimo 2. vrstico     | rtt v 7. stolpcu | izlušči čas v milisekundah
+    rtt=$(echo "$response" | head -n 2 | tail -n 1 | awk '{print $7}' | sed -e 's/.*time=\(.*\)\.[0-9]*/\1/')
+    if [[ $rtt -gt $timeTreshold ]] ; then
+      exit -1
+    fi
+    exit 0
+  fi
+}
+
+function print_stats {
+    #Izpis statistike
+    no_net_time=$(ts_net)
+    
+    printf "\n\033[K"
+    if [[ we_down -eq 1 ]] ; then
+      printf "$IRed"
+    elif [[ $no_net_time -gt 3 ]] ; then
+      printf "$Yellow"
+    fi
+    
+    printf "Without net for: "
+    
+    if [[ we_down -eq 1 ]] ; then
+      printf "$BIRed"
+    elif [[ $no_net_time -gt 3 ]] ; then
+      printf "$BIYellow"
+    fi
+    printf "$no_net_time$Color_Off | "
+    printf "Average downtime: $avg_downtime | last downtime: $last_downtime | #downtimes: $downtimes"
+#     printf " | chars: $chars | pingcount: $pingcount"
+    echo -en "\r\033[1A"
+    if [[ $chars -gt 0 ]] ; then
+      tput cuf $chars
+    fi
+    printf "\033[K"
+}
+
+while(true); do
+
+  waiting_for_ping=0
+  do_ping $local_ip $shitWifiLinkTreshold &
+  while kill -0 $! >/dev/null 2>&1 ; do
+    print_stats
+    if [[ $waiting_for_ping -eq 1 ]] ; then
+      printf "${Yellow}w$Color_Off"
+      increaseChars 1
+    fi
+    rxtx
+    waiting_for_ping=1
+    read -t 1 action
+#    if [ -z $action ] ; then
+#      do-act $action
+#    fi
+  done
+  
+  wait $!
+  estatus=$?
+  
+  if [[ $estatus -gt 0 ]] ; then
+    if [[ $we_down -eq 1 ]] ; then
+      pingcount=0
+    fi
+  fi
+  
+  if [[ $estatus -eq 1 ]] ; then
+    if [[ $testing -eq 0 ]] ; then
+      echo -n '/'
+      restartwlan "internet is kill (ping: Destination unreachable), rfkilling wlan"
+#       sleep $shortsleep
+    else
+      printf "$IRed"
+      printf "o$Color_Off"
+    fi
+  elif [[ $estatus -eq 2 ]] ; then
+    packetloss=$(($packetloss + 1))
+    if [ $packetloss -lt $pllimit ] ; then
+      printf "${BIYellow}×$Color_Off"
+    else
+      if check_rxtx ; then
+        printf "${BIYellow}×$Color_Off"
+        restartwlan "Too much lost packets, restarting wlan"
+      else
+        printf "${BCyan}×$Color_Off"
+      fi
+      packetloss=0
+    fi
+  elif [[ $estatus -eq 3 ]] ; then
+    if [ $wlankilled -eq 1 ] ; then
+#       sleep $shortsleep
+      #longsleep=$(($longsleep * 2))
+      printf "$IBlue"
+      echo -n "w"
+      printf "$Color_Off"
+      wait=$(($wait + 1))
+      if [ $wait -ge $waitlimit ] ; then
+        restartwlan "Network is taking too much time to come up, rfkilling wlan"
+        wait=0
+      fi
+    else
+      echo -n '¤'
+      #restartwlan "Network unreachable, rfkilling wlan"
+#       sleep $shortsleep
+    fi
+  else              #Če je vse, kot mora biti:
+#     we_down=0;
+#    longsleep=$lsd
+  #  echo "$response"
+    
+    if [[ $estatus -eq -1 ]] ; then
+      shitWifiLinkEvents=$(($shitWifiLinkEvents + $shitWifiLinkEventIncrementWeight ))
+      if [[ $shitWifiLinkEvents -gt $shitWifiLinkEventTreshold ]] ; then
+        restartwlan "Ping to local router is unusually high, rfkilling wlan to fix"
+      else
+        printf "${Color_Off}${IYellow}.${Color_Off}"
+      fi
+    else
+      if [[ $shitWifiLinkEvents -gt 0 ]] ; then
+        shitWifiLinkEvents=$(($shitWifiLinkEvents - $shitWifiLinkEventDecrementWeight));
+      fi
+      if [[ $pingcount -lt $pctreshold ]] ; then
+        printf "$Color_Off"
+        printf "${Red}.${Color_Off}"
+      elif [[ $pingcount -eq $pctreshold ]] ; then
+        printf "$Color_Off"
+        echo -n '.'
+        downtimes=$(($downtimes + 1))
+        if [[ $downtimes -gt 0 ]] ; then
+          calculate_downtime
+        fi
+        we_down=0
+        notify-send "Internet connection is re-establised!"
+      elif [[ $pingcount -gt $pctreshold ]] ; then
+        time_of_last_net=$(timekeeper)
+        echo -n '.'
+      fi
+    fi
+    pingcount=$(( $pingcount + 1))
+    packetloss=0
+    wlankilled=0
+    wait=0
+  fi
+  
+  increaseChars 1
+  
+  
+  
+#   sleep $shortsleep
+done
